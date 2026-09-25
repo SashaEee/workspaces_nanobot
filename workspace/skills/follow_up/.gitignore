@@ -1,0 +1,10 @@
+# Рабочие данные Follow Up: база, индексы, кэш корпуса, журналы, модели.
+data/
+logs/
+models/
+*.db
+# Настройки конкретной машины.
+.env
+site_defaults.env
+follow_up.env.local
+__pycache__/

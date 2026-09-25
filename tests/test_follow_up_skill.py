@@ -1,4 +1,4 @@
-"""Навык ``follow_up`` — внешний MCP-процесс (см. openspec/changes/add-follow-up-skill).
+"""Навык ``follow_up`` — отдельный MCP-процесс (см. openspec/changes/add-follow-up-skill).
 
 Что здесь закреплено:
 
@@ -6,8 +6,14 @@
 * в ``config.json`` статичный блок ``tools.mcpServers.follow_up`` — без путей
   конкретной машины, команда — лаунчер внутри папки навыка;
 * навык объявлен в единственном реестре ``project.json::skills``;
-* лаунчер — только стандартная библиотека, без настройки выходит с кодом 3
-  и **ничего не пишет в stdout** (это канал JSON-RPC gateway'я).
+* код сервера лежит в папке навыка, и лаунчер находит его без настройки;
+* лаунчер — только стандартная библиотека; если кода нет, выходит с кодом 3
+  и **ничего не пишет в stdout** (это канал JSON-RPC gateway'я);
+* код навыка изолирован: не импортирует проект и не импортируется им,
+  его ``requirements.txt`` не спорит с корневым, линтер проекта его не
+  проверяет (сопровождается в репозитории Follow Up).
+
+Поведение самого навыка здесь не тестируется — у него свой набор тестов.
 """
 from __future__ import annotations
 
@@ -125,8 +131,8 @@ def test_unconfigured_launcher_exits_3_and_keeps_stdout_clean(launcher_copy):
     assert "follow_up.env.local" in r.stderr
 
 
-def test_check_explains_what_is_missing(launcher_copy):
-    r = subprocess.run([sys.executable, str(launcher_copy), "--check"],
+def test_where_explains_what_is_missing(launcher_copy):
+    r = subprocess.run([sys.executable, str(launcher_copy), "--where"],
                        capture_output=True, text=True, env=_clean_env())
     info = json.loads(r.stdout)
     assert r.returncode == 3 and info["ok"] is False and info["problems"]
@@ -140,9 +146,84 @@ def test_local_file_configures_the_launcher(launcher_copy, tmp_path):
     (root / "backend" / "skill" / "mcp_server.py").write_text("", encoding="utf-8")
     (launcher_copy.parent.parent / "follow_up.env.local").write_text(
         f"FOLLOW_UP_ROOT={root}\nFOLLOW_UP_PYTHON={sys.executable}\n", encoding="utf-8")
-    r = subprocess.run([sys.executable, str(launcher_copy), "--check"],
+    r = subprocess.run([sys.executable, str(launcher_copy), "--where"],
                        capture_output=True, text=True, env=_clean_env())
     info = json.loads(r.stdout)
     assert r.returncode == 0, info
+    assert info["mode"] == "отдельный клон"
     assert info["root"] == str(root) and info["python"] == sys.executable
     assert info["models_device"] == "cpu"
+
+
+# ── код навыка в папке навыка ──────────────────────────────────────
+
+def test_bundled_server_is_found_without_configuration():
+    """Ни follow_up.env.local, ни переменных: код рядом — лаунчер готов."""
+    assert (SKILL_DIR / "backend" / "skill" / "mcp_server.py").is_file()
+    r = subprocess.run([sys.executable, str(LAUNCHER), "--where"],
+                       capture_output=True, text=True, env=_clean_env())
+    info = json.loads(r.stdout)
+    if info["local_file_exists"]:
+        pytest.skip("на этой машине есть follow_up.env.local — он важнее")
+    assert r.returncode == 0, info
+    assert info["mode"] == "встроенный код"
+    assert Path(info["root"]) == SKILL_DIR.resolve()
+    assert info["python"]
+
+
+def _imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            out.add(node.module)
+    return out
+
+
+def test_skill_code_does_not_import_the_project():
+    project = ("lib", "workspace", "gateway", "config", "cli_agent", "streamlit_app")
+    offenders = {
+        str(p.relative_to(REPO_ROOT)): sorted(m for m in _imports(p)
+                                              if m.split(".")[0] in project)
+        for p in (SKILL_DIR / "backend").rglob("*.py")
+    }
+    assert not {k: v for k, v in offenders.items() if v}
+
+
+def test_project_does_not_import_the_skill_code():
+    offenders = []
+    for d in ("lib", "workspace/tools", "workspace/utils"):
+        for p in (REPO_ROOT / d).rglob("*.py"):
+            if any(m.split(".")[0] == "backend" or "skills.follow_up" in m
+                   for m in _imports(p)):
+                offenders.append(str(p.relative_to(REPO_ROOT)))
+    assert not offenders
+
+
+def _requirement_names(path: Path) -> set[str]:
+    names = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line and not line.startswith("-"):
+            names.add(re.split(r"[\[<>=!~ ;]", line, maxsplit=1)[0].lower().replace("_", "-"))
+    return names
+
+
+def test_skill_requirements_do_not_repin_root_packages():
+    """Версии общих пакетов задаёт корневой requirements.txt, а не навык."""
+    shared = (_requirement_names(SKILL_DIR / "requirements.txt")
+              & _requirement_names(REPO_ROOT / "requirements.txt"))
+    assert not shared
+
+
+def test_project_linter_leaves_the_skill_code_to_its_repository():
+    text = (SKILL_DIR / "ruff.toml").read_text(encoding="utf-8")
+    assert 'extend = "../../../pyproject.toml"' in text
+    assert re.search(r'extend-exclude\s*=\s*\["backend"\]', text)
+
+
+def test_skill_runtime_data_is_ignored():
+    ignored = (SKILL_DIR / ".gitignore").read_text(encoding="utf-8").split()
+    assert {"data/", "logs/", "models/", "follow_up.env.local"} <= set(ignored)

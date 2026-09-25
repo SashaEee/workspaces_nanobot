@@ -96,9 +96,8 @@ metadata: {"nanobot":{"emoji":"📋","always":true}}
 
 ## Если инструментов `mcp_follow_up_*` нет
 
-Навык не настроен на этой машине или его процесс не поднялся. Скажи
-пользователю, что Follow Up сейчас недоступен, и не отвечай по актам «из
-головы». Настройка — `workspace/skills/follow_up/follow_up.env.local` (см.
-`follow_up.env.local.example` рядом) или `scripts/install_into_nanobot.py` из
-репозитория Follow Up; проверка —
-`python workspace/skills/follow_up/scripts/follow_up_mcp --check`.
+Процесс навыка не поднялся. Скажи пользователю, что Follow Up сейчас
+недоступен, и не отвечай по актам «из головы». Причину показывает
+`python workspace/skills/follow_up/scripts/follow_up_mcp --check`: чаще всего
+не хватает библиотек (`pip install -r workspace/skills/follow_up/requirements.txt`)
+или у агента нет подключения к Greenplum.
