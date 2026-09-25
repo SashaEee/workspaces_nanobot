@@ -25,6 +25,42 @@
 Безопасность: все фильтры передаются позиционными ``%s``-параметрами,
 без интерполяции строк в SQL (как в ``duckdb_query``). Observability —
 через штатный ``tool_audit_hook``.
+
+Контракт (см. ``openspec/specs/tools-history-search``):
+
+  * **Scope isolation (security)**: ``session_scope="current"`` фильтрует
+    по ``session_id`` текущего запроса (из RequestContext.session_key);
+    ``session_scope="all"`` фильтрует по ``user_id`` текущего запроса
+    (из RequestContext.sender_id). Это закрывает cross-user leakage:
+    ``scope="all"`` возвращает только события того же пользователя, не
+    глобальную выборку. При отсутствии identity для соответствующего
+    scope tool возвращает структурированную ошибку (``missing_session_identity``
+    / ``missing_user_identity``), и SQL-запрос НЕ выполняется.
+  * **Identity source**: единственный — ``RequestContext`` из
+    ``nanobot.agent.tools.context``. Имя поля фиксируется через приватный
+    helper ``_current_user_id()`` (для ``scope="all"``) — никаких обращений
+    к ``sender_id``/``session_id``/``chat_id``/``actor``/``payload`` из других
+    мест. Это инкапсулирует зависимость от nanobot 0.3.0.
+  * **Пагинация**: ``offset`` (целое ≥ 0, дефолт 0) пропускает первые
+    ``offset`` строк после ``ORDER BY timestamp DESC, id DESC``. SQL
+    запрашивает ``LIMIT effective_limit + 1`` строк; лишняя строка
+    определяет ``db_has_more``.
+  * **Детерминированный порядок**: tie-breaker по ``id`` (UUID) — стабильный
+    для равных ``timestamp`` (типично при multi-row INSERT в одном батче).
+  * **Раздельные truncation-флаги**: ``results_truncated`` (на ответе) —
+    выброшены целые события из-за ``max_result_chars``;
+    ``payload_truncated`` (на каждом событии) — payload ужат через
+    ``truncate_middle``. ``truncated`` — deprecated алиас
+    ``results_truncated``.
+  * **Честный ``has_more``**: ``db_has_more OR results_truncated`` —
+    композитная формула, чтобы следующая страница была видна даже когда
+    ``LIMIT N+1`` не обнаружил следующей строки в БД, но часть
+    отобранных событий была отброшена truncation'ом.
+  * **next_offset**: ``offset + count`` — после truncation-проходов,
+    чтобы продолжить пагинацию без пропуска отброшенных событий.
+  * **Без утечки ``user_id``**: ``user_id`` НЕ возвращается в payload'е
+    события и НЕ принимается как параметр tool'а — это внутренний
+    security attribute.
 """
 
 from __future__ import annotations
@@ -134,6 +170,19 @@ class HistorySearchToolConfig(BaseModel):
             "description": "Максимум событий в ответе (по умолчанию из конфига).",
             "minimum": 1,
         },
+        "offset": {
+            "type": "integer",
+            "description": (
+                "Сколько первых событий пропустить в сортировке "
+                "(пагинация). Дефолт 0 — первая страница. Продолжать "
+                "страницы через поле next_offset из предыдущего ответа, "
+                "НЕ через ``offset + limit`` (при results_truncated=true "
+                "часть событий была отброшена, и арифметика offset+limit "
+                "пропустит их)."
+            ),
+            "minimum": 0,
+            "default": 0,
+        },
     },
     "required": [],
 })
@@ -215,11 +264,22 @@ class HistorySearchTool(Tool):
             "Supports text query (ILIKE), event_type filter, tool_name filter "
             "(only meaningful for tool_call/tool_result; e.g. tool_name='compact_context' "
             "finds all calls/results of compact_context), time range "
-            "(since/until ISO-8601), session_scope ('current' default | 'all'). "
-            "Returns JSON {status, count, session_scope, truncated, "
+            "(since/until ISO-8601), session_scope ('current' default = "
+            "current session_id; 'all' = all sessions of the current user; "
+            "NEVER a global cross-user search). When identity-store is "
+            "unavailable for the requested scope (e.g. outside a request), "
+            "the tool returns a structured error and does NOT execute the "
+            "SQL query (missing_session_identity / missing_user_identity). "
+            "limit, offset (pagination; continue via next_offset from "
+            "previous response, NOT offset+limit when results_truncated=true). "
+            "Returns JSON {status, count, session_scope, has_more, "
+            "next_offset, results_truncated, truncated (deprecated alias), "
             "events:[{event_id, timestamp, event_type, name, level, summary, "
-            "payload}]}; event_id — UUID строки agent_gateway_logs, "
-            "payload — JSON-string. After getting results: parse payload "
+            "payload, payload_truncated}]}; event_id — UUID строки "
+            "agent_gateway_logs, payload — JSON-string. has_more=true если "
+            "есть следующая страница (композитная формула db_has_more OR "
+            "results_truncated). user_id is NEVER returned in the response "
+            "(security boundary). After getting results: parse payload "
             "(fields path/doc_id/args/result usually survive truncation), "
             "reuse any found path/doc_id instead of redoing work; if empty, "
             "say 'not found in history' — do not fabricate."
@@ -235,32 +295,63 @@ class HistorySearchTool(Tool):
         until: str | None = None,
         session_scope: str = "current",
         limit: int | None = None,
+        offset: int | None = None,
         **_kwargs: Any,
     ) -> str:
-        allow_all = session_scope == "all"
-        session_id = None
-        if not allow_all:
-            session_id = _current_session_key()
+        if session_scope not in ("current", "all"):
+            return self._error(
+                "invalid_session_scope",
+                f"session_scope must be 'current' or 'all', got {session_scope!r}",
+            )
 
+        allow_all = session_scope == "all"
+
+        if allow_all:
+            user_id = _current_user_id()
+            if not user_id:
+                return self._error(
+                    "missing_user_identity",
+                    (
+                        "session_scope='all' требует идентификатор пользователя "
+                        "из текущего request context (RequestContext.sender_id); "
+                        "identity-store недоступен или sender_id is None. "
+                        "Без identity tool не выполняет SQL-запрос и не "
+                        "возвращает чужие события."
+                    ),
+                )
+        else:
+            session_id = _current_session_key()
+            if not session_id:
+                return self._error(
+                    "missing_session_identity",
+                    (
+                        "session_scope='current' требует ключ текущей сессии "
+                        "из RequestContext.session_key; identity-store "
+                        "недоступен."
+                    ),
+                )
+
+        original_offset = max(0, int(offset or 0))
         effective_limit = min(int(limit or self.config.max_rows), self.config.max_rows)
 
         clauses: list[str] = []
         params: list[Any] = []
 
-        # scope: (allow_all OR session_id = %s)
-        clauses.append("(%s OR session_id = %s)")
-        params.append(allow_all)
-        params.append(session_id or "")
+        if allow_all:
+            # ``user_id = %s`` — единственный security boundary для
+            # cross-session search. Без ``OR session_id = %s`` / ``WHERE TRUE``:
+            # фильтрация строго по user_id. Если user_id NULL в БД —
+            # строка не попадёт в выборку (безопасное поведение, см. V004).
+            clauses.append("user_id = %s")
+            params.append(user_id)
+        else:
+            clauses.append("session_id = %s")
+            params.append(session_id)
 
-        # event_type: IS NULL => пропускаем фильтр
         clauses.append("(%s IS NULL OR event_type = %s)")
         params.append(event_type)
         params.append(event_type)
 
-        # tool_name: фильтр по имени инструмента. Имеет смысл только
-        # в комбинации с event_type ∈ {tool_call, tool_result} — но
-        # на уровне БД мы не валидируем комбинацию (если указан иной
-        # event_type, фильтр просто не даст совпадений; это безопасно).
         if tool_name:
             clauses.append("name = %s")
             params.append(tool_name)
@@ -280,13 +371,19 @@ class HistorySearchTool(Tool):
             params.append(until)
 
         schema, table = _log_table()
+        # Детерминированный порядок: ``timestamp DESC, id DESC`` — UUID как
+        # tie-breaker защищает от потери/дублей строк одного батча flush'а
+        # на границе страниц. ``LIMIT N+1`` даёт лишнюю строку для
+        # детекции наличия следующей страницы в БД.
         sql = (
             f'SELECT id, "timestamp", event_type, name, level, summary, payload '
             f'FROM "{schema}"."{table}" '
             f"WHERE {' AND '.join(clauses)} "
-            'ORDER BY "timestamp" DESC LIMIT %s'
+            'ORDER BY "timestamp" DESC, "id" DESC '
+            'LIMIT %s OFFSET %s'
         )
-        params.append(effective_limit)
+        params.append(effective_limit + 1)
+        params.append(original_offset)
 
         try:
             from utils.db import fetch
@@ -318,50 +415,125 @@ class HistorySearchTool(Tool):
                 "payload": payload_text,
             })
 
-        # Усечение с гарантией валидного JSON (агент должен распарсить ответ):
-        # 1) каждое событие — по отдельности; 2) отбрасываем самые старые
-        #    события; 3) если даже одно не влезает (экстремальный лимит) —
-        #    сжимаем payload, а при нехватке места — обнуляем его.
-        def _render(items: list[dict], trunc: bool) -> str:
+        # Phase 1 (до truncation): db_has_more определяется наличием
+        # лишней строки в выборке. Лишняя строка отбрасывается из
+        # ответа агента сразу — она служит только маркером.
+        db_has_more = len(events) > effective_limit
+        if db_has_more:
+            events = events[:effective_limit]
+
+        # Phase 2 (truncation): обрезаем payload каждого события до
+        # ``per_event_cap`` символов через ``truncate_middle``; если общий
+        # JSON не влезает в ``max_result_chars`` — отбрасываем самые
+        # старые события (``events.pop()`` в порядке DESC), а затем при
+        # необходимости уменьшаем ``cap`` (cap //= 2) и пережимаем
+        # оставшийся payload.
+        per_event_cap = 4000
+        payload_truncated_flags: dict[int, bool] = {}
+
+        for idx, ev in enumerate(events):
+            if ev["payload"] and len(ev["payload"]) > per_event_cap:
+                ev["payload"] = truncate_middle(ev["payload"], per_event_cap)
+                payload_truncated_flags[idx] = True
+            else:
+                payload_truncated_flags[idx] = False
+
+        results_truncated = False
+        cap = per_event_cap
+
+        def _render(items: list[dict], flags: dict[int, bool]) -> str:
+            """Сериализовать ответ с финальным флагом ``payload_truncated``.
+
+            ВАЖНО: ``payload_truncated`` включается в JSON при
+            формировании, чтобы проверка ``len(text) <= max_result_chars``
+            учитывала именно финальный размер ответа (включая доп.
+            поле ``payload_truncated: bool``). Раньше ``_render``
+            сериализовал события без этого флага, и проверка размера
+            проходила по «промежуточному» JSON, а финальный ответ
+            мог превысить ``max_result_chars`` на ~16-20 байт
+            (``"payload_truncated": false`` на каждое событие).
+            """
+            decorated = [
+                {**ev, "payload_truncated": bool(flags.get(idx, False))}
+                for idx, ev in enumerate(items)
+            ]
             return json.dumps(
                 {
                     "status": "success",
                     "count": len(items),
                     "session_scope": "all" if allow_all else "current",
-                    "truncated": trunc,
-                    "events": items,
+                    "events": decorated,
+                    "results_truncated": False,
+                    "has_more": False,
+                    "next_offset": original_offset + len(items),
+                    "truncated": False,
                 },
                 ensure_ascii=False,
                 default=str,
             )
 
-        per_event_cap = 4000
-        for ev in events:
-            if ev["payload"] and len(ev["payload"]) > per_event_cap:
-                ev["payload"] = truncate_middle(ev["payload"], per_event_cap)
-
-        truncated = False
-        cap = per_event_cap
         while True:
-            text = _render(events, truncated)
+            text = _render(events, payload_truncated_flags)
             if len(text) <= self.config.max_result_chars:
                 break
             if len(events) > 1:
-                events.pop()  # самое старое (список отсортирован DESC)
-                truncated = True
+                # Самое старое событие в конце (DESC). Отбрасываем его.
+                idx_dropped = len(events) - 1
+                events.pop()
+                payload_truncated_flags.pop(idx_dropped, None)
+                results_truncated = True
                 continue
-            # остался один — уменьшаем cap payload'а, иначе обнуляем
+            # Осталось одно событие — общий JSON всё ещё не влезает.
+            # Уменьшаем cap и пережимаем payload (если ещё не пуст).
             if cap > 16:
                 cap //= 2
-                if events[0]["payload"]:
+                if events and events[0]["payload"]:
                     events[0]["payload"] = truncate_middle(events[0]["payload"], cap)
+                    payload_truncated_flags[0] = True
                 continue
-            events[0]["payload"] = ""
-            truncated = True
-            text = _render(events, truncated)
+            # Кап < 16 — обнуляем payload как последнее средство. Это
+            # НЕ results_truncated (событие осталось в ответе); только
+            # payload_truncated = true.
+            if events:
+                events[0]["payload"] = ""
+                payload_truncated_flags[0] = True
+            text = _render(events, payload_truncated_flags)
             break
 
-        return text
+        # ``has_more`` вычисляется ПОСЛЕ truncation-проходов: даже если
+        # ``db_has_more = false`` (LIMIT N+1 не нашёл следующей строки в БД),
+        # ``results_truncated = true`` означает, что часть отобранных
+        # событий не показана агенту и следующая страница обязательна.
+        has_more = bool(db_has_more or results_truncated)
+
+        # ``payload_truncated`` уже добавлен в ``_render`` для каждого
+        # события — теперь просто пересобираем ответ с финальными
+        # флагами ``results_truncated`` / ``has_more`` / ``truncated``
+        # (которые нельзя было вычислить ДО выхода из truncation-цикла).
+        # ``next_offset`` — продолжить пагинацию через offset = count,
+        # не через offset + limit (при results_truncated=true часть
+        # событий была отброшена; offset + limit пропустил бы их).
+        next_offset = original_offset + len(events)
+
+        response = {
+            "status": "success",
+            "count": len(events),
+            "session_scope": "all" if allow_all else "current",
+            "has_more": has_more,
+            "next_offset": int(next_offset),
+            "results_truncated": bool(results_truncated),
+            "truncated": bool(results_truncated),
+            "events": [
+                {
+                    **ev,
+                    "payload_truncated": bool(
+                        payload_truncated_flags.get(idx, False)
+                    ),
+                }
+                for idx, ev in enumerate(events)
+            ],
+        }
+        return json.dumps(response, ensure_ascii=False, default=str)
 
     def _error(self, error_type: str, message: str) -> str:
         return json.dumps(
@@ -377,6 +549,38 @@ def _current_session_key() -> str | None:
         return current_request_session_key()
     except Exception:
         return None
+
+
+def _current_user_id() -> str | None:
+    """Получить идентификатор текущего пользователя из RequestContext.
+
+    Единственная точка обращения к ``RequestContext.sender_id`` в
+    history_search_tool. Инкапсулирует зависимость от nanobot 0.3.0:
+    если в будущей версии поле будет переименовано, адаптация делается
+    через эту функцию (см. contract-тест
+    ``tests/contract/test_history_search_identity_contract.py``).
+
+    Returns:
+        ``str`` — если ``RequestContext`` доступен и ``sender_id`` задан;
+        ``None`` — если контекста нет (вне оборота) или ``sender_id is None``.
+
+    Никаких fallback'ов на другие поля (``session_id``, ``chat_id``,
+    ``actor``, ``payload``) — отсутствие identity = жёсткий отказ.
+    """
+    try:
+        from nanobot.agent.tools.context import current_request_context
+    except Exception:
+        return None
+    try:
+        ctx = current_request_context()
+    except Exception:
+        return None
+    if ctx is None:
+        return None
+    sender_id = getattr(ctx, "sender_id", None)
+    if isinstance(sender_id, str) and sender_id:
+        return sender_id
+    return None
 
 
 def _log_table() -> tuple[str, str]:

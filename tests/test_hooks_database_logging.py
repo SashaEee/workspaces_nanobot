@@ -3,7 +3,7 @@
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -491,3 +491,135 @@ class TestBusLoggers:
         assert hook._request_id  # сгенерированный UUID
         svc.register_request.assert_called_once()
         assert svc.register_request.call_args.args[1] == hook._request_id
+
+    def test_factory_passes_user_id_from_identity_store(self):
+        """``register_request`` вызывается с ``user_id`` из identity-store
+        (RequestContext.sender_id), чтобы пара {request_id, user_id}
+        попала в индекс для последующего автозаполнения в ``_enqueue``."""
+        from lib.hooks.database_logging_hook import make_db_logging_hook_factory
+
+        svc = MagicMock()
+        svc.get_request_id.return_value = None
+        factory = make_db_logging_hook_factory(svc, agent_id="main")
+        turn = MagicMock()
+        turn.session_key = "telegram:42"
+        with patch(
+            "lib.hooks.database_logging_hook._current_request_sender_id",
+            return_value="alice",
+        ):
+            factory(turn)
+        kwargs = svc.register_request.call_args.kwargs
+        assert kwargs.get("user_id") == "alice"
+
+    def test_factory_passes_user_id_none_when_no_identity_store(self):
+        """Без RequestContext → ``user_id=None`` в register_request (события
+        пишутся с ``user_id IS NULL`` и НЕ попадают в scope='all')."""
+        from lib.hooks.database_logging_hook import make_db_logging_hook_factory
+
+        svc = MagicMock()
+        svc.get_request_id.return_value = None
+        factory = make_db_logging_hook_factory(svc, agent_id="main")
+        turn = MagicMock()
+        turn.session_key = "websocket:c1"
+        with patch(
+            "lib.hooks.database_logging_hook._current_request_sender_id",
+            return_value=None,
+        ):
+            factory(turn)
+        kwargs = svc.register_request.call_args.kwargs
+        assert kwargs.get("user_id") is None
+
+
+class TestRunFinishedEventShape:
+    """Регрессионный тест: ``run_finished`` фактически пишется хуком
+    ``DatabaseLoggingHook.after_run`` (закрывает баг №3 из proposal:
+    «пишется ли ``run_finished`` вообще»).
+    """
+
+    def test_after_run_records_run_finished_event_type(self, sys_path):
+        from lib.hooks.database_logging_hook import DatabaseLoggingHook
+        from lib.services.db_logging_service import (
+            DbLoggingService,
+            LogEvent,
+        )
+
+        svc = DbLoggingService(
+            dsn="", table_name="x", question_runs_table="y",
+        )
+        hook = DatabaseLoggingHook(svc)
+        ctx = MagicMock()
+        ctx.final_content = "hello world"
+        ctx.tools_used = ["read", "write"]
+        ctx.stop_reason = "stop"
+        ctx.had_injections = False
+        ctx.error = None
+        ctx.usage = {"total_tokens": 123}
+
+        asyncio.run(hook.before_iteration(MagicMock(session_key="cli:1")))
+        asyncio.run(hook.after_run(ctx))
+        events = [e for e in svc._queue.queue if isinstance(e, LogEvent)]
+        assert any(e.event_type == "run_finished" for e in events), (
+            "after_run должен положить LogEvent с event_type='run_finished'"
+        )
+
+    def test_after_run_payload_shape(self, sys_path):
+        """Payload ``run_finished`` содержит ожидаемые поля
+        (для ``history_search``-парсинга)."""
+        from lib.hooks.database_logging_hook import DatabaseLoggingHook
+        from lib.services.db_logging_service import (
+            DbLoggingService,
+            LogEvent,
+        )
+
+        svc = DbLoggingService(
+            dsn="", table_name="x", question_runs_table="y",
+        )
+        hook = DatabaseLoggingHook(svc)
+        ctx = MagicMock()
+        ctx.final_content = "ответ"
+        ctx.tools_used = ["a", "b"]
+        ctx.stop_reason = "stop"
+        ctx.had_injections = False
+        ctx.error = None
+        ctx.usage = {"total_tokens": 7}
+
+        asyncio.run(hook.before_iteration(MagicMock(session_key="cli:1")))
+        asyncio.run(hook.after_run(ctx))
+        events = [e for e in svc._queue.queue if isinstance(e, LogEvent)]
+        run_ev = next(e for e in events if e.event_type == "run_finished")
+        assert run_ev.payload["final_content"] == "ответ"
+        assert run_ev.payload["tools_used"] == ["a", "b"]
+        assert run_ev.payload["stop_reason"] == "stop"
+        assert run_ev.payload["had_injections"] is False
+
+    def test_run_finished_user_id_reaches_insert(self, sys_path):
+        """Регрессия на fix-history-search-user-isolation: ``run_finished``
+        доходит до INSERT с ``user_id`` (через автозаполнение из
+        индекса в ``_enqueue`` по request_id matching).
+
+        Сценарий: register_request с user_id="alice" → эмиттим
+        ``run_finished`` с тем же request_id → INSERT содержит user_id="alice".
+        """
+        from lib.hooks.database_logging_hook import DatabaseLoggingHook
+        from lib.services.db_logging_service import (
+            DbLoggingService,
+            LogEvent,
+        )
+
+        svc = DbLoggingService(
+            dsn="postgresql://x",
+            table_name="agent_gateway_logs",
+            question_runs_table="agent_question_runs",
+        )
+        svc.register_request("cli:1", "r1", user_id="alice", chat_id="c1")
+
+        # Эмулируем прямой emit ``run_finished`` с request_id=r1 и
+        # пустым user_id — _enqueue должен подставить "alice" из индекса.
+        event = LogEvent(
+            event_type="run_finished",
+            session_id="cli:1",
+            request_id="r1",
+            user_id=None,
+        )
+        svc._enqueue(event)
+        assert event.user_id == "alice"

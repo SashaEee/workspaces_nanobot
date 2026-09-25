@@ -14,6 +14,87 @@ from typing import Any
 os.environ.setdefault("PYTHONUTF8", "1")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
+
+# ---------------------------------------------------------------------------
+# Application entrypoint: parse --profile + _initialize_settings
+#
+# Streamlit имеет **особый lifecycle**: ``streamlit run streamlit_app.py``
+# вызывает ``runpy.run_path`` и каждый ``st.rerun()`` re-executes тело
+# скрипта (но ``streamlit_app`` остаётся в ``sys.modules``, так что
+# module-level statements выполняются заново при каждом rerun).
+#
+# Чтобы соблюсти spec-контракт «second call → already initialized»,
+# ставим guard через ``globals()``: module-level initialization
+# выполняется ровно один раз за lifetime процесса Streamlit. Guard не
+# меняет lifecycle-gate (``_initialize_settings`` остаётся строгой) —
+# он лишь предотвращает повторный ВЫЗОВ из этого модуля.
+#
+# Поддерживаемая форма запуска (см. design.md Decision 4):
+#   ``streamlit run streamlit_app.py -- --profile=prod``
+# Всё после ``--`` стримлит пробрасывает в ``sys.argv`` скрипта как
+# позиционные аргументы. Парсим их вручную (argparse не подходит —
+# ``--help`` мигнул бы ``SystemExit(0)``).
+# ---------------------------------------------------------------------------
+
+_SUPPORTED_PROFILES = ("prod", "test")
+
+from config import ConfigurationError  # noqa: E402 — нужен в _resolve_profile_from_argv
+
+
+def _resolve_profile_from_argv(argv: list[str] | None = None) -> str:
+    """Достать ``--profile=<v>`` или ``--profile <v>`` из ``sys.argv``.
+
+    Streamlit пробрасывает ``<args>`` после ``--`` как позиционные
+    элементы ``sys.argv`` (``streamlit run streamlit_app.py -- --profile=prod``
+    → ``sys.argv == [..., "streamlit_app.py", "--profile=prod"]``).
+    Поддерживаем обе формы (``--profile=prod`` / ``--profile prod``).
+    """
+    args = list(sys.argv) if argv is None else list(argv)
+    for i, arg in enumerate(args):
+        if arg.startswith("--profile="):
+            value = arg.split("=", 1)[1]
+            if value:
+                return value
+            break
+        if arg == "--profile" and i + 1 < len(args):
+            return args[i + 1]
+    raise ConfigurationError("--profile is required")
+
+
+_resolved_profile = _resolve_profile_from_argv()
+if _resolved_profile not in _SUPPORTED_PROFILES:
+    raise ConfigurationError(
+        f"--profile={_resolved_profile!r} is not supported "
+        f"(allowed: prod, test)"
+    )
+
+# Guard против streamlit re-execution: ``st.rerun()`` запускает module-level
+# statements заново через ``runpy``. Персистентность зависит от того, как
+# Streamlit кеширует модуль — это не гарантировано контрактом, поэтому
+# НЕ полагаемся на ``globals()`` (которая очищается при некоторых формах
+# re-execution). Вместо этого используем фактический state
+# ``_LazySettings._inner_dict`` в модуле ``config`` (живёт в
+# ``sys.modules["config"]``, который гарантированно персистентен):
+# init уже выполнен ⇔ ``config.SETTINGS._inner_dict is not None``.
+#
+# ``hasattr`` вместо прямого доступа — для тестов, которые мокают
+# ``config.SETTINGS`` через простой объект без ``_inner_dict``:
+# guard должен тихо инициализировать в этом случае (тесты передают
+# свой mock _initialize_settings через cfg._initialize_settings).
+#
+# Это превращает guard в **декларативную проверку реального lifecycle state**,
+# а не в эфемерный module-attr флаг.
+import config as _streamlit_cfg
+if not hasattr(_streamlit_cfg.SETTINGS, "_inner_dict") or _streamlit_cfg.SETTINGS._inner_dict is None:
+    # Первый (или первый после реального process restart) запуск —
+    # делаем init. Если ``st.rerun()`` действительно re-executed
+    # module-level код, ``_inner_dict`` уже заполнен и мы пропускаем
+    # второй вызов. ``_initialize_settings`` остаётся строгой (second call
+    # с любым значением → ``already initialized``); guard не меняет её,
+    # а лишь предотвращает второй вызов из этого модуля.
+    _streamlit_cfg._initialize_settings(profile=_resolved_profile)
+
+
 import streamlit as st
 
 # Подключаем workspace, чтобы импортировать utils.db

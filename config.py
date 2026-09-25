@@ -11,6 +11,9 @@ _SESSION_MANAGER_FILE = _PROJECT_FILE.parent / "session_manager.json"
 _PROFILES_DIR = _PROJECT_FILE.parent / "profiles"
 
 
+_SUPPORTED_PROFILES = frozenset({"prod", "test"})
+
+
 class AttrDict(dict):
     def __getattr__(self, name):
         try:
@@ -168,8 +171,12 @@ def _deep_merge(base: dict, override: dict) -> None:
 # ConfigurationResolver — единая точка формирования SETTINGS
 # ---------------------------------------------------------------------------
 #
-# Главный принцип: режим (test/prod) существует только во время разрешения
-# конфигурации. После получения SETTINGS режим исчезает из runtime-модели.
+# Главный принцип: профиль (``prod``/``test``) задаётся явно через
+# ``_initialize_settings(profile)``, вызванный из application entrypoint
+# (argv ``--profile``). После успешной инициализации ``SETTINGS``
+# доступен через mapping-proxy ``_LazySettings``. До инициализации
+# доступ к ``SETTINGS`` бросает ``ConfigurationError`` — никаких
+# дефолтов и module-level ``SETTINGS = ...``.
 #
 # Порядок merge (поздний перекрывает ранний):
 #   1. project.json                    — база
@@ -223,28 +230,10 @@ class ConfigurationError(ValueError):
     не маскировалось подставным значением. Единственный источник правды —
     ConfigurationResolver.
 
-    Объявлен ДО ``_resolve_mode`` / ``resolve_application_config`` —
+    Объявлён ДО ``_initialize_settings`` / ``resolve_application_config`` —
     иначе ошибки конфигурации на module-level импорте превращались бы в
     ``NameError: ConfigurationError is not defined``.
     """
-
-
-def _resolve_mode(profile_arg: str | None = None) -> str:
-    """Определить активный профиль. Приоритет: CLI > env > default=test.
-
-    default=test — fail-safe: разработчик, набравший `python gateway.py`
-    без флагов, попадает в изолированный test, а не в прод.
-    """
-    mode = profile_arg
-    if mode is None:
-        env_value = os.environ.get("NANOBOT_PROFILE", "").strip()
-        mode = env_value or "test"
-    if not re.fullmatch(r"[a-z0-9_-]+", mode):
-        raise ConfigurationError(
-            f"NANOBOT_PROFILE={mode!r} недопустим: "
-            f"только [a-z0-9_-]+"
-        )
-    return mode
 
 
 def _load_session_manager_override() -> dict:
@@ -302,7 +291,7 @@ def _merge_profile_overlay(cfg: dict, mode: str) -> None:
     overlay = _PROFILES_DIR / f"{mode}.jsonc"
     if not overlay.exists():
         raise ConfigurationError(
-            f"NANOBOT_PROFILE={mode!r}, но profiles/{mode}.jsonc не найден. "
+            f"profiles/{mode}.jsonc не найден. "
             f"Создайте profiles/{mode}.jsonc."
         )
     overlay_cfg = load_config_json(overlay)
@@ -435,12 +424,14 @@ def _(s: str) -> str:
     return s.replace(" ", "_").replace("-", "_")
 
 
-def resolve_application_config(profile: str | None = None) -> AttrDict:
+def resolve_application_config(profile: str) -> AttrDict:
     """Единая точка формирования SETTINGS.
 
-    Используется всеми entry points (cli_agent.py, gateway.py,
-    streamlit_app.py). Возвращает AttrDict — тот же тип, который
-    существующий код уже импортирует через ``config.SETTINGS``.
+    Используется внутри ``_initialize_settings(profile)`` после проверки
+    whitelist ``{"prod", "test"}``. Возвращает ``AttrDict``. Profile
+    передаётся как **обязательный** явный аргумент — никакого env,
+    default'а или mode=None. Это точка, в которой профиль становится
+    частью runtime.
 
     Порядок merge (поздний перекрывает ранний):
       1. project.json                    — база
@@ -452,8 +443,6 @@ def resolve_application_config(profile: str | None = None) -> AttrDict:
       6. ${VAR} резолв через os.environ
       7. validate_runtime_isolation()    — hard-fail
     """
-    mode = _resolve_mode(profile)
-
     cfg: dict = {}
     if _PROJECT_FILE.exists():
         project_data = load_config_json(_PROJECT_FILE)
@@ -478,44 +467,201 @@ def resolve_application_config(profile: str | None = None) -> AttrDict:
     # в project.json/config.json нашли свои значения.
     _export_secrets_to_env(cfg)
 
-    _merge_profile_overlay(cfg, mode)
+    _merge_profile_overlay(cfg, profile)
 
     cfg = _resolve_env_refs(cfg)
 
-    validate_runtime_isolation(cfg, mode)
+    validate_runtime_isolation(cfg, profile)
 
     return AttrDict(cfg)
 
 
-def get_active_profile() -> str:
-    """Вернуть профиль, с которым построен модульный ``SETTINGS``.
-
-    Возвращает ``_ACTIVE_PROFILE`` — значение, зафиксированное при
-    import-time. Это гарантирует, что ``SETTINGS`` и
-    ``get_active_profile()`` согласованы между собой (а не два
-    независимых чтения env, которые могут разойтись).
-
-    Для динамического определения профиля в runtime (например, в
-    ApplicationContext.create(profile=...)) используйте
-    ``_resolve_mode(profile)`` напрямую.
-    """
-    return _ACTIVE_PROFILE
-
-# Порядок мержей (поздний перекрывает ранний) — через ConfigurationResolver:
-#   1. project.json                    — база
-#   2. session_manager.json (если есть) — per-deploy override (pool/timeouts)
-#   3. config.json                     — nanobot-настройки
-#   4. profiles/<mode>.jsonc           — профиль (если mode != prod)
-#   5. .secrets.env (${VAR})           — резолв env refs
-#   6. validate_runtime_isolation()    — hard-fail
+# ---------------------------------------------------------------------------
+# Lifecycle-gate: _initialize_settings + _LazySettings proxy
 #
-# Глобальный SETTINGS строится ОДИН РАЗ через ConfigurationResolver —
-# это ЕДИНСТВЕННЫЙ загрузчик конфигурации в проекте. Раньше здесь был
-# отдельный «старый» bootstrap (project.json → config.json → .secrets.env),
-# что создавало второй путь формирования конфигурации, расходящийся с
-# profile-aware путём через Resolver. Теперь оба пути объединены.
-_ACTIVE_PROFILE = _resolve_mode()
-SETTINGS = resolve_application_config(profile=_ACTIVE_PROFILE)
+# SETTINGS публикуется ТОЛЬКО через ``_initialize_settings(profile)``,
+# вызванный из application entrypoint (argv ``--profile``). Никакого
+# module-level ``SETTINGS = ...`` больше нет: ``import config`` ничего
+# не инициализирует. До явного вызова ``SETTINGS`` отдаёт
+# ``ConfigurationError`` на любой ``__getitem__``/``__getattr__``/``.get``.
+#
+# Контракт и архитектурное обоснование — в
+# ``openspec/changes/config-profile-cli-flag`` (proposal/design/tasks).
+# ---------------------------------------------------------------------------
+
+
+class _LazySettings:
+    """Compatibility proxy для ``SETTINGS``.
+
+    Состояния: UNINITIALIZED (пустой ``_inner_dict``) и INITIALIZED
+    (заполненный ``_inner_dict`` — ``AttrDict``, построенный
+    ``resolve_application_config``). Переключение — только через
+    ``_initialize_settings(profile)``; двойная инициализация бросает
+    ``ConfigurationError``.
+
+    Поддерживает mapping-access (``SETTINGS["profile"]``) для нового
+    кода и attribute-access (``SETTINGS.profile`` — через ``__getattr__``)
+    для backward-compat с существующим кодом (``streamlit_app.py``,
+    ``history_search_tool.py`` и т.п.).
+    """
+
+    __slots__ = ("_inner_dict",)
+
+    def __init__(self) -> None:
+        self._inner_dict: AttrDict | None = None
+
+    def _ensure_initialized(self) -> AttrDict:
+        if self._inner_dict is None:
+            raise ConfigurationError(
+                "SETTINGS not initialized: call _initialize_settings(profile) "
+                "from the application entrypoint"
+            )
+        return self._inner_dict
+
+    def __getitem__(self, key: str) -> Any:
+        return self._ensure_initialized()[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """``SETTINGS[k] = v`` для legacy-тестов, мутирующих proxy in-place.
+
+        Допустимо только в INITIALIZED state — UNINITIALIZED proxy не
+        имеет inner_dict для мутации. Бросает ту же ``ConfigurationError``,
+        что и ``__getitem__``, чтобы не маскировать lifecycle-ошибки.
+        """
+        self._ensure_initialized()[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        self._ensure_initialized()
+        del self._inner_dict[key]
+
+    def __getattr__(self, name: str) -> Any:
+        # ``__slots__`` доступ через object.__getattribute__; проксируем только
+        # атрибуты дочернего dict (mapping-стиль), включая ``get``.
+        if name == "_inner_dict":
+            raise AttributeError(name)
+        inner = self._ensure_initialized()
+        try:
+            return inner[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __contains__(self, key: str) -> bool:
+        if self._inner_dict is None:
+            return False
+        return key in self._inner_dict
+
+    def __iter__(self):
+        return iter(self._ensure_initialized())
+
+    def __len__(self) -> int:
+        return len(self._ensure_initialized())
+
+    def __repr__(self) -> str:
+        if self._inner_dict is None:
+            return "<_LazySettings UNINITIALIZED>"
+        return f"<_LazySettings INITIALIZED profile={self._inner_dict.get('profile')!r}>"
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Mapping-style ``.get`` — используется в некоторых существующих путях
+        (``SETTINGS.get('channels', {})``); при UNINITIALIZED бросает ту же
+        ``ConfigurationError``, что и ``__getitem__``. ``default`` не
+        маскирует ошибку инициализации (это несовместимо с
+        инвариантом «профиль инициализируется entrypoint'ом до любого
+        runtime-импорта»).
+        """
+        inner = self._ensure_initialized()
+        return inner.get(key, default)
+
+    def items(self):
+        return self._ensure_initialized().items()
+
+    def keys(self):
+        return self._ensure_initialized().keys()
+
+    def values(self):
+        return self._ensure_initialized().values()
+
+
+SETTINGS: Any = _LazySettings()
+
+
+def _initialize_settings(profile: str) -> None:
+    """Lifecycle-gate: единственная точка публикации ``SETTINGS``.
+
+    Args:
+        profile: ``"prod"`` или ``"test"`` (только whitelist).
+
+    Raises:
+        ConfigurationError:
+            * если ``_initialize_settings`` уже был вызван в этом процессе
+              — **сначала проверяется lifecycle state**, и только потом
+              whitelist. Любое значение второго аргумента →
+              ``"already initialized"`` (даже невалидный профиль вроде
+              ``"dev"`` не пройдёт через эту проверку, чтобы не маскировать
+              факт уже-инициализированного state — defensive programming);
+            * если ``profile`` не из whitelist ``{"prod", "test"}``
+              (выполняется ТОЛЬКО на первом вызове, до публикации SETTINGS);
+            * если ``SETTINGS`` proxy corrupted (неожиданный тип
+              — не должно случаться в runtime, диагностическая защита).
+
+    Поведение при ошибке валидации merge/resolver
+    (``profiles/<mode>.jsonc`` отсутствует, runtime-таблицы не
+    соответствуют и т.п.) — также ``ConfigurationError`` (пробрасывается
+    из ``resolve_application_config``), runtime-импорты не выполняются.
+    """
+    settings = SETTINGS
+    if not isinstance(settings, _LazySettings):
+        raise ConfigurationError(
+            "SETTINGS proxy corrupted: expected _LazySettings instance"
+        )
+    if settings._inner_dict is not None:
+        # Lifecycle wins: даже невалидный профиль ("dev", "foo bar")
+        # даёт "already initialized", а не "is not supported". Это
+        # предотвращает маскировку уже-инициализированного state за
+        # ошибкой whitelist. См. spec § D.1 + tasks.md D.3.
+        raise ConfigurationError(
+            "SETTINGS already initialized: _initialize_settings(profile) "
+            "may be called only once per process"
+        )
+    if not isinstance(profile, str) or profile not in _SUPPORTED_PROFILES:
+        raise ConfigurationError(
+            f"profile={profile!r} is not supported "
+            f"(allowed: {', '.join(sorted(_SUPPORTED_PROFILES))})"
+        )
+
+    cfg = resolve_application_config(profile)
+    # Профиль должен быть доступен в SETTINGS как ``SETTINGS["profile"]``
+    # (canonical API) независимо от того, что лежит в project.json.
+    if isinstance(cfg, dict):
+        cfg["profile"] = profile
+    settings._inner_dict = cfg
+
+    # Провайдерский LLM_API_KEY setdefault'ом (см. исторический блок ниже).
+    _providers = cfg.get("providers", {}) or {}
+    if isinstance(_providers.get("llm"), dict):
+        _llm_key = _providers["llm"].get("api_key") or _providers["llm"].get("apiKey")
+        if _llm_key and isinstance(_llm_key, str) and not _llm_key.startswith("${"):
+            os.environ.setdefault("LLM_API_KEY", _llm_key)
+
+
+def is_settings_initialized() -> bool:
+    """``True`` после успешного ``_initialize_settings(profile)``.
+
+    Используется в ``tests/test_standalone_failfast.py`` и для
+    diagnostic checks. Не должно читаться runtime-кодом как «профиль
+    известен» — для этого есть ``SETTINGS["profile"]``.
+    """
+    return isinstance(SETTINGS, _LazySettings) and SETTINGS._inner_dict is not None
+
+
+def get_active_profile() -> str:
+    """Вернуть активный профиль (``SETTINGS["profile"]``).
+
+    Бросает ``ConfigurationError``, если ``_initialize_settings`` ещё
+    не вызван. Заменяет старую module-level ``_ACTIVE_PROFILE`` —
+    единственный источник правды теперь живёт в ``SETTINGS["profile"]``.
+    """
+    return SETTINGS["profile"]
 
 
 def get_setting(*keys: str, default=None):
@@ -527,14 +673,33 @@ def get_setting(*keys: str, default=None):
 
     Используется в коде, где требуется значение по умолчанию при
     отсутствии ключа.
+
+    **Важно про lifecycle:** ``get_setting`` — это **compatibility helper**.
+    Если SETTINGS не инициализирован (proxy UNINITIALIZED),
+    ``get_setting`` возвращает ``default``, а НЕ поднимает
+    ``ConfigurationError``. Это намеренное поведение для backward-compat
+    с callers типа ``subprocess_manager.SubprocessManager.__init__``
+    (запускается из ``gateway.py:_run`` **после** ``_initialize_settings``,
+    но исторически модуль импортировался с module-level ``SETTINGS``;
+    default-fallback защищает от случайного вызова в неправильном
+    lifecycle context).
+
+    Для кода, который **требует** инициализированного SETTINGS
+    (новый runtime-код, entrypoint'ы, ApplicationContext),
+    используйте ``SETTINGS["..."]`` / ``SETTINGS.get("...")`` —
+    они поднимают ``ConfigurationError("not initialized")`` если proxy
+    UNINITIALIZED. См. design.md Decision 0/1 (lifecycle-gate).
     """
-    node: object = SETTINGS
-    for k in keys:
-        if isinstance(node, dict) and k in node:
-            node = node[k]
-        else:
-            return default
-    return node
+    try:
+        node: object = SETTINGS._inner_dict if isinstance(SETTINGS, _LazySettings) else SETTINGS
+        for k in keys:
+            if isinstance(node, dict) and k in node:
+                node = node[k]
+            else:
+                return default
+        return node
+    except ConfigurationError:
+        return default
 
 
 def require_setting(*keys: str):
@@ -544,7 +709,7 @@ def require_setting(*keys: str):
     если ключ (на любом уровне) отсутствует. Не возвращает fallback-литерал:
     отсутствие настройки — ошибка, а не молчаливая подстановка.
     """
-    node: object = SETTINGS
+    node: object = SETTINGS._inner_dict if isinstance(SETTINGS, _LazySettings) else SETTINGS
     for k in keys:
         if isinstance(node, dict) and k in node:
             node = node[k]
@@ -553,20 +718,3 @@ def require_setting(*keys: str):
                 "Отсутствует обязательный ключ конфига: " + ".".join(keys)
             )
     return node
-
-
-# Экспорт ``os.environ`` теперь полностью внутри ConfigurationResolver
-# (``_export_secrets_to_env`` и пост-резолв экспорт в ``_resolve_env_refs``).
-# Раньше здесь был legacy-блок с двумя ``_flatten_env`` циклами и
-# провайдерским LLM_API_KEY export'ом — он перенесён в Resolver.
-
-# Провайдерский LLM_API_KEY можно ставить и здесь — это идемпотентный
-# setdefault, и Resolver тоже мог бы его ставить, но legacy-коду
-# ``lib.services.config_service.ConfigService._pre_resolve_env_refs``
-# нужен LLM_API_KEY в env ещё ДО ``_load_runtime_config``. Поэтому
-# выставляем здесь, после построения SETTINGS.
-_providers = SETTINGS.get("providers", {}) or {}
-if isinstance(_providers.get("llm"), dict):
-    _llm_key = _providers["llm"].get("api_key") or _providers["llm"].get("apiKey")
-    if _llm_key and isinstance(_llm_key, str) and not _llm_key.startswith("${"):
-        os.environ.setdefault("LLM_API_KEY", _llm_key)

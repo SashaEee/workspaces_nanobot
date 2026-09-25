@@ -12,6 +12,110 @@
 > `remove-vector-index-store` единственный источник векторных данных —
 > `<storage_table>` (DuckDB-снапшот через `PgDuckDbSyncService`); FAISS-индекс
 > собирается в памяти при старте gateway (`provider.preload_indexes`).
+>
+> **MAJOR-релиз:** единственный источник профиля конфигурации — CLI-флаг
+> `--profile` (см. `openspec/changes/config-profile-cli-flag`). Whitelist
+> закрытый: только `prod` и `test`. Env vars для передачи профиля
+> (исторически — `NANOBOT_PROFILE`) **полностью удалены** как
+> действующий механизм. Все три `application entrypoint`
+> (`gateway.py`, `cli_agent.py`, `streamlit_app.py`) без `--profile`
+> падают с `ConfigurationError` и `exit 2`. **BREAKING** для деплоев,
+> использующих env-based передачу профиля — требуется миграция на
+> `command: python gateway.py --profile=prod` (см. `docs/PROFILES.md`
+> § «Migration»).
+
+> **SECURITY:** `history_search(session_scope="all")` больше не
+> возвращает глобальный набор событий (cross-user leakage). Фильтрация
+> теперь идёт по `user_id` (security boundary), а не по
+> `(%s OR session_id = %s)` с булевым ослаблением. Колонка `user_id`
+> добавлена в `agent_gateway_logs` (миграция V004, идемпотентный
+> backfill из `agent_question_runs.user_id`). При отсутствии
+> identity-store (`RequestContext.sender_id`) — `missing_user_identity`
+> / `missing_session_identity` (SQL-запрос НЕ выполняется). Изменение
+> по поведению: `scope="all"` теперь означает «все сессии текущего
+> пользователя», а не «глобальная выборка». Tool API не изменился
+> (новых параметров нет).
+
+### Security
+
+- **Cross-user isolation в `history_search`.** Закрыт gap №5 из
+  `docs/architecture/HISTORY_SEARCH_ANALYSIS.md`: фильтр
+  `(%s OR session_id = %s)` в `history_search_tool.py` заменён на две
+  взаимоисключающие ветви — `session_scope="current"` фильтрует по
+  `session_id`, `session_scope="all"` — по `user_id` из
+  `RequestContext.sender_id`. Никаких unscoped-fallback'ов
+  (`WHERE TRUE`, `OR TRUE`, `IS NULL OR user_id`). Добавлен
+  contract-тест на `RequestContext.sender_id`
+  (`tests/contract/test_history_search_identity_contract.py`) и
+  architecture guards (`tests/test_history_search_user_isolation_guards.py`).
+
+### Changed
+
+- **`agent_gateway_logs.user_id` (security boundary).** Колонка
+  `user_id VARCHAR(256)` рядом с `request_id`/`session_id`/`channel`/
+  `actor`/`name` + индекс `(user_id, "timestamp" DESC)`. Миграция
+  `V004__agent_gateway_logs_user_id.sql`: ADD COLUMN IF NOT EXISTS +
+  backfill UPDATE через `request_id → agent_question_runs.user_id IS
+  NOT NULL` (NULL-пользователь не «протекает») + CREATE INDEX IF NOT
+  EXISTS. Идемпотентна. `LogEvent.user_id: str | None` — намеренная
+  денормализация из `agent_question_runs.user_id` (первичный
+  source of truth). Consistency через single-writer invariant
+  (`DbLoggingService` — единственный writer) и request_id matching в
+  `_enqueue` (закрывает security окно stale-event). Новый
+  primary logging-security тест
+  `test_stale_event_does_not_inherit_next_request_user_id` —
+  обязательный acceptance gate.
+- **`history_search(session_scope="all")` — новая семантика.** Раньше
+  возвращал глобальный набор событий, теперь — все сессии текущего
+  пользователя. Без identity-store — структурированная ошибка
+  (`missing_user_identity` / `missing_session_identity`), fetch НЕ
+  вызван. Tool API не изменился (`user_id` НЕ параметр, НЕ
+  возвращается в payload'е). Breaking change по поведению: агенты на
+  prod начнут получать либо события только своего пользователя,
+  либо `missing_user_identity` (если request context не дошёл).
+- **Producers прокидывают `user_id`.** `database_logging_hook._factory`
+  резолвит `sender_id` из identity-store и передаёт в
+  `register_request(session_key, request_id, user_id=...)`. Индекс
+  хранит пару `{request_id, user_id}` атомарно под lock'ом.
+  `_SubagentLoggingHook._finalize` явно прокидывает `user_id`
+  родителя в `LogEvent.user_id` (explicit value побеждает индекс).
+  `context_compaction._record_event_log` прокидывает `user_id` через
+  `record_event(user_id=...)`. `record_event` теперь пишет колонку
+  `user_id` в INSERT.
+
+### Removed
+
+- **`workspace/utils/event_log.py` удалён целиком.** Раньше был
+  fallback-sync-fallback-INSERT (`record_event` /
+  `record_sync_event` / `emit_sync_event`) для случая, когда
+  `DbLoggingService` ещё не доступен. Теперь единый путь —
+  `DbLoggingService.try_log_event(...)` с no-op for business +
+  operational WARNING. Удалён и тест `tests/test_event_log.py`.
+  Тесты `test_context_compaction.py` / `test_preload_service.py`
+  адаптированы под новый API (моки на
+  `lib.services.db_logging_service.try_log_event`).
+- **Дублирующие concern-проверки в `record_external_compaction`.**
+  Ранний return `if not self.notify_in_history: return` удалён —
+  ответственность за разделение concerns (UI-notice vs event log)
+  перенесена в `_notify`. См. подробности в
+  `docs/ARCHITECTURE.md` § «Управление сжатием контекста».
+
+### Changed (logging pipeline)
+
+- **Единый logging pipeline через `DbLoggingService`.** Producer'ы
+  (`ContextCompactionService`, `PgDuckDbSyncService`, `DuckDbCacheStore`,
+  `PreloadService`, `ApplicationContext._record_sync_skipped`) передают
+  события через `db_logging_service.log_event(LogEvent(...))` или
+  `DbLoggingService.try_log_event(...)` — defensive helper с
+  единым WARNING при недоступности сервиса. DI поднимается через
+  `functools.partial` (`RuntimePatcher.patch_compact_command`) и
+  параметр `run_repl(...)` (`lib/cli/console_loop.py`) — никаких
+  промежуточных полей на `agent` (ни `_db_logging_service`, ни
+  `db_logging_service`). `patch_compaction_tracking` остаётся активным
+  при `notify_in_history=false`: `_record_event_log` идёт ВСЕГДА при
+  `enabled=True`, observability-trail `history_search(event_type=
+  "context_compacted")` не зависит от UI-уведомления (закрывает gap №1
+  из `docs/architecture/HISTORY_SEARCH_ANALYSIS.md` + design D8).
 
 ### Fixed
 
@@ -103,6 +207,81 @@
   `loaded_items[i]["signature_status"]` (inline-вычисленный при прогреве),
   без чтения persisted `metadata.signature`.
 
+### Changed
+
+- **Профиль конфигурации теперь определяется только CLI-флагом
+  `--profile`** (whitelist: `prod`, `test`). Все три `application
+  entrypoint` (`gateway.py`, `cli_agent.py`, `streamlit_app.py`)
+  требуют обязательный `--profile` и без него падают с
+  `ConfigurationError` + `exit 2`. Env vars для передачи профиля
+  более не используются (исторически — `NANOBOT_PROFILE`); ни runtime
+  fallback, ни deploy descriptors (`docker-compose` / k8s / systemd /
+  GitHub Actions), ни активная документация. **BREAKING** для
+  существующих деплоев, использующих env-based передачу профиля —
+  требуется миграция на `command: python gateway.py --profile=prod`
+  (см. `docs/PROFILES.md` § «Migration»).
+- **`config._initialize_settings(profile)` — единственная точка
+  публикации `SETTINGS`.** После `import config` `SETTINGS` —
+  `_LazySettings` proxy, и любой доступ (`__getitem__` / `__getattr__`
+  / `.get`) поднимает `ConfigurationError`, пока
+  `config._initialize_settings(profile)` не отработает. Никакого
+  module-level `SETTINGS = resolve_application_config(...)`, никакого
+  default-профиля, никакого auto-init при чтении. Whitelist профилей
+  ужесточён: только `{"prod", "test"}` (раньше было regex
+  `[a-z0-9_-]+` — фактически любое имя; введение третьего профиля
+  требует отдельного OpenSpec change).
+- **`ApplicationContext.create(profile=...)`**: убрана избыточная
+  ctx-пересборка при `profile != _ACTIVE_PROFILE` (после change
+  `_ACTIVE_PROFILE` module-level global больше нет — `ApplicationContext`
+  просто читает уже инициализированный `SETTINGS` из `_LazySettings`).
+  Если caller вызвал `create` без предварительного entrypoint init —
+  `ConfigurationError` (`SETTINGS["profile"]` через proxy).
+- **Application subprocess получает профиль через argv, не через env.**
+  `lib.services.subprocess_manager.spawn_streamlit` теперь явно
+  добавляет `--profile=<SETTINGS["profile"]>` в argv child
+  `streamlit_app.py` (раньше child падал с
+  `ConfigurationError("--profile is required")` на module-level, и
+  Streamlit UI не стартовал). Подробности — `docs/INTERNAL_API.md`
+  § «Передача профиля в application subprocess».
+
+- **`history_search`: пагинация и честные truncation-флаги**
+  (`openspec/changes/improve-history-search-pagination-and-logging`).
+  Добавлен параметр `offset` (≥ 0, дефолт 0) и поля ответа `has_more` /
+  `next_offset` — продолжение пагинации через `offset = next_offset`,
+  а не через `offset + limit`, чтобы при `results_truncated=true` не
+  пропустить отброшенные события. SQL: `ORDER BY "timestamp" DESC,
+  "id" DESC LIMIT %s OFFSET %s` (детерминированный tie-breaker по
+  UUID `agent_gateway_logs.id` стабилен для равных `timestamp` в
+  одном батче flush'а); `LIMIT effective_limit + 1` даёт лишнюю
+  строку для детекции `db_has_more`. Разделены два разных механизма
+  truncation: `results_truncated` (на ответе — выброшены целые события,
+  чтобы влезть в `max_result_chars`) и `payload_truncated` (на каждом
+  событии — ужатие payload'а конкретного события через
+  `truncate_middle`). Старое поле `truncated` помечено **deprecated**
+  в пользу `results_truncated`; алиас удаляется в отдельном follow-up
+  change. `has_more = db_has_more OR results_truncated` — композитная
+  формула, гарантирующая что следующая страница остаётся видна даже
+  когда `LIMIT N+1` не нашёл следующей строки в БД, но часть
+  отобранных событий была отброшена truncation'ом.
+- **`db_logging_service`: диагностика `written_by_type` и
+  `oldest_queued_age_sec`** в `get_stats()`. `written_by_type: dict[str, int]`
+  инкрементируется **только** после успешного `_flush_batch` (не в
+  `_enqueue`); счётчик не сбрасывается при повторном `start()` —
+  lifetime эквивалентен lifetime экземпляра. `oldest_queued_age_sec`
+  — возраст самого старого `LogEvent` в очереди (`max(time.time()
+  - queued_at)`); учитываются только `LogEvent` (не
+  `_QuestionRunRecord` и не `_FlushSentinel`); пустая очередь или
+  очередь только из служебных объектов даёт `None`. `LogEvent.
+  queued_at: float | None` заполняется в `_enqueue` значением
+  `time.time()`.
+- **`logging.db.flush_interval_sec` в типизированной конфигурации**:
+  новое поле `LoggingDbSettings.flush_interval_sec: float | None`,
+  диапазон `0.5 ≤ value ≤ 60.0`, дефолт `5.0`. Значение передаётся
+  через `ConfigurationResolver` → `ProjectSettings` →
+  `ApplicationContext` → `DbLoggingService.__init__`; вне диапазона —
+  `pydantic.ValidationError` на старте `ApplicationContext.create`.
+  Сервис НЕ читает конфиг напрямую. См. `AGENTS.md` § «Configuration».
+
 ### Removed
 
 - **Таблица `public.agent_vector_index_store`** (имя бралось из
@@ -124,6 +303,62 @@
   — удалён.
 - **Legacy `gateway.vector.index.default_root`** — упоминания в
   документации помечены DEPRECATED; FAISS не персистится на диск.
+- **Module-level `_ACTIVE_PROFILE` global в `config.py`** — удалён
+  как действующий runtime-механизм. Канонический доступ к активному
+  профилю теперь — `SETTINGS["profile"]` (или `get_active_profile()`
+  поверх него).
+- **`config._resolve_mode()`** — удалена полностью. После удаления
+  env-чтения функция сводилась к whitelist-валидации, которая
+  встроена в `config._initialize_settings(profile)`.
+- **Env var для передачи профиля (исторически — `NANOBOT_PROFILE`)** —
+  полностью удалена как действующий runtime-механизм. Ни runtime
+  fallback, ни deploy descriptors (`docker-compose` / k8s / systemd /
+  GitHub Actions), ни активная документация не используют её.
+  Приложение просто не работает с такими env vars; их игнорирование —
+  отсутствие кода, который их читает, а не активный sanitization.
+  Деплои, использующие эту переменную, должны быть переведены на
+  `command: python gateway.py --profile=prod` (см. `docs/PROFILES.md`
+  § «Migration»).
+
+### Known Issues
+
+- **`tests/test_history_search_tool.py::test_search_current_session_filters_by_session`**:
+  order-dependent flake — патч `utils.db.fetch` ломается в полном прогоне
+  после `test_streamlit_app.py` (который переустанавливает `sys.modules["utils.db"]`
+  через собственный mock). Помечен `@pytest.mark.xfail(strict=False)` с TODO
+  на отдельный change. Pre-existing, не связан с config-profile-cli-flag.
+
+### Fixed
+
+- **Pre-existing regressions в legacy-тестах** (не связаны со спекой
+  `config-profile-cli-flag`, но блокировали зелёный pytest — чиним отдельным
+  commit'ом):
+  - `streamlit_app.py:93` — `decode_media_list` → `decode_json_list`
+    (старая функция удалена при рефакторинге медиа-кодека; 42 теста в
+    `test_streamlit_app.py` падали на collection с `ImportError`).
+  - `gateway.py:_entrypoint_main` — `UnboundLocalError` на `__logo__`/
+    `__version__`: импорты внутри `if args.smoke:` приводили к тому, что
+    Python считал имена локальными, но ветка else не имела своего
+    импорта. Импорты вынесены выше `if`. Регрессия в Phase B.
+  - `tests/test_config.py::TestLoadEnv` — 2 теста устарели после
+    CHANGELOG-фикса `load_env` (заголовок секции теперь требует `:`
+    после `#`); поправлены под текущее поведение.
+  - `tests/test_streamlit_app.py::mock_all`, `tests/test_gateway.py` —
+    mock `config` модуля дополнен `ConfigurationError` (Phase B импорт
+    на module-level) и `_initialize_settings = MagicMock()` (no-op,
+    чтобы autouse-fixture из `conftest.py` не упирался в
+    `already initialized`).
+  - `tests/test_gateway.py::TestMain::test_clean_shutdown` — patch
+    `lib.lifecycle.gateway_runner.GatewayRunner` вместо
+    `gateway.GatewayRunner` (Phase B сделал import lazy внутри
+    `_entrypoint_main`); добавлен `--profile=test` в `sys.argv`;
+    мок `RuntimePatcher.apply_all` чтобы избежать зависимости от
+    `workspace/tools/*.py`, импортирующих `nanobot.agent.tools.base`.
+  - `tests/test_profile_lifecycle.py::test_streamlit_profile_accepted`
+    — вместо полного `exec_module` streamlit_app.py (который пытается
+    загрузить чат из БД, отсутствующей в CI env) запускается только
+    module-level до первого runtime-вызова
+    (`db_messages = _load_chat_history`).
 
 ### Fixed
 
